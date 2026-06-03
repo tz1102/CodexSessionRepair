@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codex_local.core import build_unified_index, delete_thread, repair_codex_indexes
+from codex_local.core import build_unified_index, delete_thread, delete_threads, repair_codex_indexes
 
 
 def write_jsonl(path: Path, rows):
@@ -275,6 +275,53 @@ class CodexLocalIndexTests(unittest.TestCase):
             self.assertEqual(providers["thread-b"], "custom")
             self.assertEqual(providers["thread-c"], "my9527")
 
+    def test_repair_defaults_to_openai_when_account_login_has_no_model_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+            rollout = home / "sessions/2026/05/02/rollout-2026-05-02T10-00-00-thread-b.jsonl"
+            write_jsonl(rollout, [
+                {
+                    "timestamp": "2026-05-02T02:00:00.000Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "thread-b",
+                        "timestamp": "2026-05-02T02:00:00.000Z",
+                        "cwd": r"D:\idea_space\beta",
+                        "source": "vscode",
+                        "model_provider": "custom",
+                    },
+                }
+            ])
+            write_jsonl(home / "session_index.jsonl", [])
+            create_state_db(home / "state_5.sqlite", [
+                {
+                    "id": "thread-b",
+                    "rollout_path": str(rollout),
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "cwd": r"D:\idea_space\beta",
+                    "title": "token provider thread",
+                    "model_provider": "custom",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                    "preview": "token provider thread",
+                },
+            ])
+
+            result = repair_codex_indexes(home)
+
+            self.assertEqual(result.provider_bridge_target, "openai")
+            self.assertEqual(result.provider_bridged_rollouts, 1)
+            self.assertEqual(result.provider_bridged_sqlite_threads, 1)
+
+            meta = json.loads(rollout.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(meta["payload"]["model_provider"], "openai")
+            con = sqlite3.connect(home / "state_5.sqlite")
+            provider = con.execute("select model_provider from threads where id = 'thread-b'").fetchone()[0]
+            con.close()
+            self.assertEqual(provider, "openai")
+
     def test_delete_thread_removes_indexes_and_moves_rollout_to_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -335,6 +382,77 @@ class CodexLocalIndexTests(unittest.TestCase):
 
             index = build_unified_index(home)
             self.assertNotIn("thread-b", [thread.id for project in index.projects for thread in project.threads])
+
+    def test_delete_threads_removes_multiple_threads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rollout_b = home / "sessions/2026/05/02/rollout-2026-05-02T10-00-00-thread-b.jsonl"
+            rollout_c = home / "sessions/2026/05/03/rollout-2026-05-03T10-00-00-thread-c.jsonl"
+            for rollout, thread_id in [(rollout_b, "thread-b"), (rollout_c, "thread-c")]:
+                write_jsonl(rollout, [
+                    {
+                        "timestamp": "2026-05-02T02:00:00.000Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": thread_id,
+                            "timestamp": "2026-05-02T02:00:00.000Z",
+                            "cwd": r"D:\idea_space\beta",
+                            "source": "vscode",
+                            "model_provider": "openai",
+                        },
+                    }
+                ])
+            write_jsonl(home / "session_index.jsonl", [
+                {"id": "thread-b", "thread_name": "删除 B", "updated_at": "2026-05-02T02:00:00Z"},
+                {"id": "thread-c", "thread_name": "删除 C", "updated_at": "2026-05-03T02:00:00Z"},
+                {"id": "thread-d", "thread_name": "保留 D", "updated_at": "2026-05-04T02:00:00Z"},
+            ])
+            create_state_db(home / "state_5.sqlite", [
+                {
+                    "id": "thread-b",
+                    "rollout_path": str(rollout_b),
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "cwd": r"D:\idea_space\beta",
+                    "title": "删除 B",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                    "preview": "删除 B",
+                },
+                {
+                    "id": "thread-c",
+                    "rollout_path": str(rollout_c),
+                    "created_at": 2,
+                    "updated_at": 2,
+                    "cwd": r"D:\idea_space\beta",
+                    "title": "删除 C",
+                    "created_at_ms": 2,
+                    "updated_at_ms": 2,
+                    "preview": "删除 C",
+                },
+            ])
+
+            result = delete_threads(home, ["thread-b", "thread-c"])
+
+            self.assertEqual(result.requested_count, 2)
+            self.assertEqual(result.deleted_count, 2)
+            self.assertEqual(result.failed_count, 0)
+            self.assertEqual([item.thread_id for item in result.deleted], ["thread-b", "thread-c"])
+            self.assertFalse(rollout_b.exists())
+            self.assertFalse(rollout_c.exists())
+            self.assertTrue(all(item.backup_rollout_path and item.backup_rollout_path.exists() for item in result.deleted))
+
+            remaining_index_rows = [
+                json.loads(line)
+                for line in (home / "session_index.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([row["id"] for row in remaining_index_rows], ["thread-d"])
+
+            con = sqlite3.connect(home / "state_5.sqlite")
+            remaining = con.execute("select id from threads order by id").fetchall()
+            con.close()
+            self.assertEqual(remaining, [])
 
 
 if __name__ == "__main__":

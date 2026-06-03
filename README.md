@@ -12,6 +12,8 @@
 
 网页里每个线程右侧都有“删除”。删除前会自动备份索引和对应的 rollout 文件，确认后该线程会从本地列表、SQLite 索引和 `session_index.jsonl` 中移除。
 
+网页列表支持多选线程后批量删除。可以先搜索筛选，再点“选择当前”只选中当前筛选结果；批量删除会逐条备份后删除，并在完成后刷新列表。
+
 ## 删除指定线程
 
 ```powershell
@@ -62,7 +64,9 @@
  
 ## Provider 桥接修复
 
-`repair` 会读取 `~\.codex\config.toml` 里的当前 `model_provider`，并把本机历史中 `vscode`、`cli`、`appServer` 这类交互式线程的 `session_meta.payload.model_provider` 桥接到当前 provider。这样从账号登录切到 API token/custom provider 后，Codex Desktop 左侧默认列表不会再只显示当前 provider 下的新线程。
+`repair` 会读取 `~\.codex\config.toml` 里的当前 `model_provider`，并把本机历史中 `vscode`、`cli`、`appServer` 这类交互式线程的 `session_meta.payload.model_provider` 桥接到当前 provider。这样在账号登录和 API token/custom provider 之间来回切换后，Codex Desktop 左侧默认列表不会再只显示当前 provider 下的新线程。
+
+账号登录通常不会在 `config.toml` 写入 `model_provider`。这种情况下，`repair` 会按 Codex 账号登录默认 provider `openai` 处理，把 token/custom provider 留下的交互式历史桥回 `openai`。
 
 修复会先备份：
 

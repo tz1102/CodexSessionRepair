@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .core import ThreadNotFoundError, build_unified_index, delete_thread, repair_codex_indexes
+from .core import ThreadNotFoundError, build_unified_index, delete_thread, delete_threads, repair_codex_indexes
 
 
 def serve(codex_home: Path, host: str = "127.0.0.1", port: int = 8787, open_browser: bool = True) -> None:
@@ -54,6 +54,18 @@ def _make_handler(codex_home: Path):
                     self._send_json(delete_thread(codex_home, thread_id).to_dict())
                 except ThreadNotFoundError as exc:
                     self._send_json({"error": str(exc)}, status=404)
+                return
+            if parsed.path == "/api/delete-batch":
+                payload = self._read_json_body()
+                raw_thread_ids = payload.get("thread_ids")
+                if not isinstance(raw_thread_ids, list):
+                    self._send_json({"error": "缺少 thread_ids。"}, status=400)
+                    return
+                thread_ids = [str(thread_id).strip() for thread_id in raw_thread_ids if str(thread_id).strip()]
+                if not thread_ids:
+                    self._send_json({"error": "至少选择一个线程。"}, status=400)
+                    return
+                self._send_json(delete_threads(codex_home, thread_ids).to_dict())
                 return
             self.send_error(404)
 
@@ -188,13 +200,34 @@ _INDEX_HTML = r"""<!doctype html>
     .metric span { color: var(--muted); }
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(180px, 1fr) auto;
+      grid-template-columns: minmax(180px, 1fr) auto auto auto auto auto;
       gap: 10px;
       margin-bottom: 12px;
+      align-items: center;
     }
     input {
       width: 100%;
       padding: 0 12px;
+    }
+    input.thread-check {
+      width: 18px;
+      height: 18px;
+      margin: 0;
+      padding: 0;
+      accent-color: var(--accent);
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+    button.danger-action {
+      border-color: #d92d20;
+      color: #b42318;
+      background: #fff5f3;
+    }
+    .selected-count {
+      color: var(--muted);
+      white-space: nowrap;
     }
     .project {
       background: var(--panel);
@@ -221,12 +254,18 @@ _INDEX_HTML = r"""<!doctype html>
     }
     .thread {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: auto minmax(0, 1fr) auto;
       gap: 12px;
       padding: 11px 14px;
       border-bottom: 1px solid #edf0f4;
+      align-items: start;
     }
     .thread:last-child { border-bottom: 0; }
+    .thread-select {
+      display: flex;
+      align-items: start;
+      padding-top: 2px;
+    }
     .title {
       font-weight: 560;
       line-height: 1.35;
@@ -317,12 +356,17 @@ _INDEX_HTML = r"""<!doctype html>
     <div class="toolbar">
       <input id="filter" placeholder="搜索项目路径或线程标题">
       <button id="expand">展开/收起</button>
+      <button id="selectVisible">选择当前</button>
+      <button id="clearSelected">清空选择</button>
+      <button class="danger-action" id="deleteSelected" disabled>批量删除</button>
+      <span class="selected-count" id="selectedCount">已选 0 个</span>
     </div>
     <section id="content"></section>
   </main>
   <script>
     let data = null;
     let collapsed = new Set();
+    let selected = new Set();
 
     const $ = (id) => document.getElementById(id);
 
@@ -334,11 +378,15 @@ _INDEX_HTML = r"""<!doctype html>
 
     function render() {
       if (!data) return;
+      pruneSelection();
       $('home').textContent = `本地目录：${data.codex_home}`;
       $('projects').textContent = data.total_projects;
       $('threads').textContent = data.total_threads;
       $('sqliteMissing').textContent = data.missing_sqlite_threads;
       $('indexMissing').textContent = data.missing_session_index_threads;
+      $('selectedCount').textContent = `已选 ${selected.size} 个`;
+      $('deleteSelected').disabled = selected.size === 0;
+      $('clearSelected').disabled = selected.size === 0;
 
       const q = $('filter').value.trim().toLowerCase();
       const projects = data.projects
@@ -382,6 +430,16 @@ _INDEX_HTML = r"""<!doctype html>
           deleteThread(el.dataset.deleteThread);
         });
       });
+      document.querySelectorAll('[data-select-thread]').forEach(el => {
+        el.addEventListener('click', (event) => {
+          event.stopPropagation();
+        });
+        el.addEventListener('change', () => {
+          if (el.checked) selected.add(el.dataset.selectThread);
+          else selected.delete(el.dataset.selectThread);
+          render();
+        });
+      });
     }
 
     function renderThread(thread) {
@@ -389,7 +447,11 @@ _INDEX_HTML = r"""<!doctype html>
       if (!thread.in_sqlite) badges.push('<span class="badge warn">缺 sqlite</span>');
       if (!thread.in_session_index) badges.push('<span class="badge warn">缺列表</span>');
       if (!badges.length) badges.push('<span class="badge ok">已索引</span>');
+      const checked = selected.has(thread.id) ? ' checked' : '';
       return `<div class="thread">
+        <label class="thread-select" title="选择线程">
+          <input class="thread-check" type="checkbox" data-select-thread="${escapeHtml(thread.id)}"${checked}>
+        </label>
         <div>
           <div class="title">${escapeHtml(thread.title)}</div>
           <div class="meta">${escapeHtml(thread.updated_at_iso || '')} · ${escapeHtml(thread.id || '')} · ${escapeHtml(thread.rollout_path || '')}</div>
@@ -408,6 +470,40 @@ _INDEX_HTML = r"""<!doctype html>
         }
       }
       return null;
+    }
+
+    function pruneSelection() {
+      const allThreadIds = new Set();
+      for (const project of data.projects) {
+        for (const thread of project.threads) allThreadIds.add(thread.id);
+      }
+      for (const threadId of Array.from(selected)) {
+        if (!allThreadIds.has(threadId)) selected.delete(threadId);
+      }
+    }
+
+    function visibleThreadIds() {
+      if (!data) return [];
+      const q = $('filter').value.trim().toLowerCase();
+      const ids = [];
+      for (const project of data.projects) {
+        for (const thread of project.threads) {
+          const haystack = `${project.cwd} ${thread.title} ${thread.preview}`.toLowerCase();
+          if (!q || haystack.includes(q)) ids.push(thread.id);
+        }
+      }
+      return ids;
+    }
+
+    function selectedThreads() {
+      const threads = [];
+      if (!data) return threads;
+      for (const project of data.projects) {
+        for (const thread of project.threads) {
+          if (selected.has(thread.id)) threads.push(thread);
+        }
+      }
+      return threads;
     }
 
     async function deleteThread(threadId) {
@@ -431,6 +527,30 @@ _INDEX_HTML = r"""<!doctype html>
       await load();
     }
 
+    async function deleteSelectedThreads() {
+      const threads = selectedThreads();
+      if (!threads.length) return;
+      const preview = threads.slice(0, 6).map(thread => `- ${thread.title}`).join('\n');
+      const more = threads.length > 6 ? `\n... 还有 ${threads.length - 6} 个` : '';
+      if (!confirm(`删除选中的 ${threads.length} 个线程吗？\n\n${preview}${more}\n\n会逐条自动备份，删除后列表会刷新。`)) return;
+      const res = await fetch('/api/delete-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thread_ids: threads.map(thread => thread.id) })
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        alert(result.error || '批量删除失败。');
+        return;
+      }
+      for (const item of result.deleted || []) selected.delete(item.thread_id);
+      const failureText = result.failed_count
+        ? `\n失败: ${result.failed_count}\n${(result.failures || []).map(item => `${item.thread_id}: ${item.error}`).join('\n')}`
+        : '';
+      alert(`批量删除完成\n成功: ${result.deleted_count}\n失败: ${result.failed_count}${failureText}`);
+      await load();
+    }
+
     function escapeHtml(value) {
       return String(value ?? '')
         .replaceAll('&', '&amp;')
@@ -446,6 +566,15 @@ _INDEX_HTML = r"""<!doctype html>
       collapsed = collapsed.size ? new Set() : new Set(data.projects.map(project => project.cwd));
       render();
     });
+    $('selectVisible').addEventListener('click', () => {
+      for (const threadId of visibleThreadIds()) selected.add(threadId);
+      render();
+    });
+    $('clearSelected').addEventListener('click', () => {
+      selected.clear();
+      render();
+    });
+    $('deleteSelected').addEventListener('click', deleteSelectedThreads);
     $('repair').addEventListener('click', async () => {
       if (!confirm('修复前会自动备份 state_5.sqlite 和 session_index.jsonl。继续吗？')) return;
       const res = await fetch('/api/repair', { method: 'POST' });

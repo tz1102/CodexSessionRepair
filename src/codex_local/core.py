@@ -35,6 +35,8 @@ THREAD_TABLE_INSERT_COLUMNS = [
     "preview",
 ]
 
+DEFAULT_ACCOUNT_MODEL_PROVIDER = "openai"
+
 
 @dataclass
 class ThreadRecord:
@@ -178,6 +180,43 @@ class DeleteResult:
         }
 
 
+@dataclass
+class BatchDeleteFailure:
+    thread_id: str
+    error: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class BatchDeleteResult:
+    thread_ids: list[str]
+    deleted: list[DeleteResult]
+    failures: list[BatchDeleteFailure]
+
+    @property
+    def requested_count(self) -> int:
+        return len(self.thread_ids)
+
+    @property
+    def deleted_count(self) -> int:
+        return len(self.deleted)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failures)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requested_count": self.requested_count,
+            "deleted_count": self.deleted_count,
+            "failed_count": self.failed_count,
+            "deleted": [item.to_dict() for item in self.deleted],
+            "failures": [item.to_dict() for item in self.failures],
+        }
+
+
 class ThreadNotFoundError(ValueError):
     pass
 
@@ -286,6 +325,20 @@ def delete_thread(codex_home: str | Path | None, thread_id: str) -> DeleteResult
         rollout_moved=rollout_moved,
         backup_rollout_path=backup_rollout_path,
     )
+
+
+def delete_threads(codex_home: str | Path | None, thread_ids: list[str]) -> BatchDeleteResult:
+    clean_thread_ids = _clean_thread_ids(thread_ids)
+    deleted: list[DeleteResult] = []
+    failures: list[BatchDeleteFailure] = []
+
+    for thread_id in clean_thread_ids:
+        try:
+            deleted.append(delete_thread(codex_home, thread_id))
+        except ThreadNotFoundError as exc:
+            failures.append(BatchDeleteFailure(thread_id=thread_id, error=str(exc)))
+
+    return BatchDeleteResult(thread_ids=clean_thread_ids, deleted=deleted, failures=failures)
 
 
 def _read_session_rollouts(home: Path) -> dict[str, ThreadRecord]:
@@ -492,14 +545,16 @@ def _bridge_interactive_threads_to_current_provider(home: Path, backup_dir: Path
 def _read_current_model_provider(home: Path) -> str:
     config_path = home / "config.toml"
     if not config_path.exists():
-        return ""
+        return DEFAULT_ACCOUNT_MODEL_PROVIDER
     try:
         with config_path.open("rb") as handle:
             data = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
         return ""
     provider = data.get("model_provider")
-    return provider.strip() if isinstance(provider, str) else ""
+    if isinstance(provider, str) and provider.strip():
+        return provider.strip()
+    return DEFAULT_ACCOUNT_MODEL_PROVIDER
 
 
 def _bridge_rollout_providers(home: Path, backup_dir: Path, target_provider: str) -> int:
@@ -819,3 +874,15 @@ def _coerce_int(value: Any) -> int:
 
 def _has_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _clean_thread_ids(thread_ids: list[str]) -> list[str]:
+    clean_ids: list[str] = []
+    seen: set[str] = set()
+    for thread_id in thread_ids:
+        clean_thread_id = str(thread_id).strip()
+        if not clean_thread_id or clean_thread_id in seen:
+            continue
+        clean_ids.append(clean_thread_id)
+        seen.add(clean_thread_id)
+    return clean_ids
